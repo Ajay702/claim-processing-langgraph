@@ -7,6 +7,8 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from app.services.pdf_parser import extract_pages
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -107,16 +109,25 @@ async def process_claim(
     validated_claim_id = _validate_claim_id(claim_id)
     _validate_pdf(file)
     saved_path = await _save_to_tmp(file)
+
+    # --- Phase 2: page-level text extraction ---
+    try:
+        pages = extract_pages(str(saved_path))
+    except ValueError as exc:
+        logger.warning("PDF extraction failed for claim %s: %s", validated_claim_id, exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     logger.info(
-        "Claim received — claim_id=%s file=%s path=%s",
+        "Claim parsed — claim_id=%s file=%s pages=%d",
         validated_claim_id,
         file.filename,
-        saved_path,
+        len(pages),
     )
     return {
         "claim_id": validated_claim_id,
         "filename": file.filename,
-        "status": "received",
+        "pages_count": len(pages),
+        "status": "parsed",
     }
 
 
