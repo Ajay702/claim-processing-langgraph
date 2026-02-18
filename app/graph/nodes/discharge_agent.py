@@ -27,13 +27,54 @@ Rules:
 - Do NOT hallucinate or fabricate data.
 - Return ONLY the JSON object, no explanation or commentary."""
 
-_DEFAULT_DISCHARGE_DATA: dict[str, Any] = {
-    "diagnosis": None,
-    "admission_date": None,
-    "discharge_date": None,
-    "treating_physician": None,
-    "hospital_name": None,
-}
+_DISCHARGE_FIELDS: list[str] = [
+    "diagnosis",
+    "admission_date",
+    "discharge_date",
+    "treating_physician",
+    "hospital_name",
+]
+
+_DEFAULT_DISCHARGE_DATA: dict[str, Any] = {k: None for k in _DISCHARGE_FIELDS}
+
+
+def _validate_discharge_data(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalise the LLM output for discharge extraction.
+
+    Ensures every expected key exists and values are strings or None.
+
+    Args:
+        parsed: Raw parsed JSON from LLM.
+
+    Returns:
+        A validated discharge dict.
+    """
+    result: dict[str, Any] = {}
+    for key in _DISCHARGE_FIELDS:
+        val = parsed.get(key)
+        if val is not None and not isinstance(val, str):
+            val = str(val)
+        result[key] = val if val else None
+    return result
+
+
+def _compute_confidence(data: dict[str, Any]) -> str:
+    """Determine extraction confidence based on filled fields.
+
+    Args:
+        data: Validated discharge dict.
+
+    Returns:
+        ``"high"``, ``"medium"``, or ``"low"``.
+    """
+    filled = sum(1 for k in _DISCHARGE_FIELDS if data.get(k) is not None)
+    total = len(_DISCHARGE_FIELDS)
+    ratio = filled / total
+    if ratio >= 0.8:
+        return "high"
+    if ratio >= 0.4:
+        return "medium"
+    return "low"
 
 
 def extract_discharge(pages: list[dict[str, Any]], page_numbers: list[int]) -> dict[str, Any]:
@@ -44,30 +85,38 @@ def extract_discharge(pages: list[dict[str, Any]], page_numbers: list[int]) -> d
         page_numbers: Page numbers classified as discharge summaries.
 
     Returns:
-        Structured discharge dict. Falls back to defaults on failure.
+        Structured discharge dict with ``confidence`` field.
+        Falls back to defaults on failure.
     """
+    default = {**_DEFAULT_DISCHARGE_DATA, "confidence": "low"}
+
     if not page_numbers:
         logger.info("Discharge Agent — no discharge pages to process")
-        return dict(_DEFAULT_DISCHARGE_DATA)
+        return default
 
     combined_text = collect_page_texts(pages, page_numbers)
     if not combined_text.strip():
         logger.warning("Discharge Agent — discharge pages are empty")
-        return dict(_DEFAULT_DISCHARGE_DATA)
+        return default
 
     try:
         raw = call_llm(DISCHARGE_SYSTEM_PROMPT, combined_text)
         parsed = json.loads(raw)
-        result: dict[str, Any] = {}
-        for key in _DEFAULT_DISCHARGE_DATA:
-            result[key] = parsed.get(key)
-        return result
+
+        if not isinstance(parsed, dict):
+            logger.warning("Discharge Agent — LLM returned non-dict JSON")
+            return default
+
+        validated = _validate_discharge_data(parsed)
+        validated["confidence"] = _compute_confidence(validated)
+        return validated
+
     except (json.JSONDecodeError, KeyError, IndexError) as exc:
         logger.warning("Discharge Agent — failed to parse LLM response: %s", exc)
-        return dict(_DEFAULT_DISCHARGE_DATA)
+        return default
     except Exception as exc:
         logger.error("Discharge Agent — LLM call failed: %s", exc)
-        return dict(_DEFAULT_DISCHARGE_DATA)
+        return default
 
 
 def discharge_agent_node(state: ClaimState) -> dict[str, Any]:
@@ -85,6 +134,10 @@ def discharge_agent_node(state: ClaimState) -> dict[str, Any]:
         state["claim_id"],
         page_numbers,
     )
-    discharge_data = extract_discharge(state["pages"], page_numbers)
-    logger.info("Discharge Agent — claim_id=%s result=%s", state["claim_id"], discharge_data)
+    try:
+        discharge_data = extract_discharge(state["pages"], page_numbers)
+    except Exception as exc:
+        logger.exception("Discharge Agent — unhandled error for claim %s", state["claim_id"])
+        discharge_data = {**_DEFAULT_DISCHARGE_DATA, "confidence": "low"}
+    logger.info("Discharge Agent — claim_id=%s confidence=%s result=%s", state["claim_id"], discharge_data.get("confidence"), discharge_data)
     return {"discharge_data": discharge_data}

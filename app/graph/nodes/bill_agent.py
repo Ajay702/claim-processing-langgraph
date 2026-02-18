@@ -40,45 +40,103 @@ Rules:
 - Do NOT hallucinate items not present in the text.
 - Return ONLY the JSON object, no explanation or commentary."""
 
+_ITEM_REQUIRED_KEYS: set[str] = {"description", "quantity", "unit_price", "total_price"}
+
 _DEFAULT_BILL_DATA: dict[str, Any] = {
     "items": [],
     "calculated_total": 0,
+    "verified_total": 0,
+    "total_mismatch": False,
+    "confidence": "low",
 }
 
 
+def _validate_item(item: Any) -> dict[str, Any] | None:
+    """Validate and normalise a single bill line item.
+
+    Args:
+        item: Raw item dict from LLM output.
+
+    Returns:
+        A validated item dict, or ``None`` if the item is malformed.
+    """
+    if not isinstance(item, dict):
+        return None
+    try:
+        description = str(item.get("description", ""))
+        if not description:
+            return None
+        quantity = float(item.get("quantity", 1))
+        unit_price = float(item.get("unit_price", 0))
+        total_price = round(quantity * unit_price, 2)
+        return {
+            "description": description,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "total_price": total_price,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
 def _sanitise_bill(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Validate and recalculate bill data returned by the LLM.
+    """Validate structure, recalculate totals, and flag mismatches.
 
     Args:
         parsed: Raw parsed JSON from LLM.
 
     Returns:
-        Sanitised bill dict with recalculated total.
+        Sanitised bill dict with verified_total and total_mismatch.
     """
-    items_raw = parsed.get("items", [])
+    if not isinstance(parsed, dict):
+        logger.warning("Bill Agent — LLM returned non-dict JSON")
+        return dict(_DEFAULT_BILL_DATA)
+
+    items_raw = parsed.get("items")
+    if not isinstance(items_raw, list):
+        logger.warning("Bill Agent — 'items' is not a list")
+        return dict(_DEFAULT_BILL_DATA)
+
     clean_items: list[dict[str, Any]] = []
+    for raw_item in items_raw:
+        validated = _validate_item(raw_item)
+        if validated is not None:
+            clean_items.append(validated)
+        else:
+            logger.debug("Bill Agent — skipping malformed item: %s", raw_item)
 
-    for item in items_raw:
-        try:
-            description = str(item.get("description", ""))
-            quantity = float(item.get("quantity", 1))
-            unit_price = float(item.get("unit_price", 0))
-            total_price = round(quantity * unit_price, 2)
-            clean_items.append({
-                "description": description,
-                "quantity": quantity,
-                "unit_price": unit_price,
-                "total_price": total_price,
-            })
-        except (TypeError, ValueError) as exc:
-            logger.debug("Bill Agent — skipping malformed item %s: %s", item, exc)
-            continue
+    # Python-verified total — independent of LLM
+    verified_total = round(sum(i["total_price"] for i in clean_items), 2)
 
-    calculated_total = round(sum(i["total_price"] for i in clean_items), 2)
+    # LLM-reported total
+    try:
+        llm_total = round(float(parsed.get("calculated_total", 0)), 2)
+    except (TypeError, ValueError):
+        llm_total = 0.0
+
+    total_mismatch = abs(verified_total - llm_total) > 0.01
+
+    if total_mismatch:
+        logger.warning(
+            "Bill Agent — total mismatch: LLM=%s verified=%s",
+            llm_total,
+            verified_total,
+        )
+
+    # Confidence heuristic
+    if len(clean_items) >= 3:
+        confidence = "high"
+    elif len(clean_items) >= 1:
+        confidence = "medium"
+    else:
+        confidence = "low"
 
     return {
         "items": clean_items,
-        "calculated_total": calculated_total,
+        "calculated_total": llm_total,
+        "verified_total": verified_total,
+        "total_mismatch": total_mismatch,
+        "confidence": confidence,
     }
 
 
@@ -90,7 +148,8 @@ def extract_bill(pages: list[dict[str, Any]], page_numbers: list[int]) -> dict[s
         page_numbers: Page numbers classified as itemized bills.
 
     Returns:
-        Structured bill dict. Falls back to defaults on failure.
+        Structured bill dict with verification fields.
+        Falls back to defaults on failure.
     """
     if not page_numbers:
         logger.info("Bill Agent — no bill pages to process")
@@ -128,6 +187,10 @@ def bill_agent_node(state: ClaimState) -> dict[str, Any]:
         state["claim_id"],
         page_numbers,
     )
-    bill_data = extract_bill(state["pages"], page_numbers)
-    logger.info("Bill Agent — claim_id=%s result=%s", state["claim_id"], bill_data)
+    try:
+        bill_data = extract_bill(state["pages"], page_numbers)
+    except Exception as exc:
+        logger.exception("Bill Agent — unhandled error for claim %s", state["claim_id"])
+        bill_data = dict(_DEFAULT_BILL_DATA)
+    logger.info("Bill Agent — claim_id=%s confidence=%s verified_total=%s mismatch=%s", state["claim_id"], bill_data.get("confidence"), bill_data.get("verified_total"), bill_data.get("total_mismatch"))
     return {"bill_data": bill_data}

@@ -27,13 +27,54 @@ Rules:
 - Do NOT hallucinate or fabricate data.
 - Return ONLY the JSON object, no explanation or commentary."""
 
-_DEFAULT_ID_DATA: dict[str, Any] = {
-    "patient_name": None,
-    "date_of_birth": None,
-    "policy_number": None,
-    "member_id": None,
-    "insurance_provider": None,
-}
+_ID_FIELDS: list[str] = [
+    "patient_name",
+    "date_of_birth",
+    "policy_number",
+    "member_id",
+    "insurance_provider",
+]
+
+_DEFAULT_ID_DATA: dict[str, Any] = {k: None for k in _ID_FIELDS}
+
+
+def _validate_id_data(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalise the LLM output for identity extraction.
+
+    Ensures every expected key exists and values are strings or None.
+
+    Args:
+        parsed: Raw parsed JSON from LLM.
+
+    Returns:
+        A validated identity dict.
+    """
+    result: dict[str, Any] = {}
+    for key in _ID_FIELDS:
+        val = parsed.get(key)
+        if val is not None and not isinstance(val, str):
+            val = str(val)
+        result[key] = val if val else None
+    return result
+
+
+def _compute_confidence(data: dict[str, Any]) -> str:
+    """Determine extraction confidence based on filled fields.
+
+    Args:
+        data: Validated identity dict.
+
+    Returns:
+        ``"high"``, ``"medium"``, or ``"low"``.
+    """
+    filled = sum(1 for k in _ID_FIELDS if data.get(k) is not None)
+    total = len(_ID_FIELDS)
+    ratio = filled / total
+    if ratio >= 0.8:
+        return "high"
+    if ratio >= 0.4:
+        return "medium"
+    return "low"
 
 
 def extract_identity(pages: list[dict[str, Any]], page_numbers: list[int]) -> dict[str, Any]:
@@ -44,31 +85,38 @@ def extract_identity(pages: list[dict[str, Any]], page_numbers: list[int]) -> di
         page_numbers: Page numbers classified as identity documents.
 
     Returns:
-        Structured identity dict. Falls back to defaults on failure.
+        Structured identity dict with ``confidence`` field.
+        Falls back to defaults on failure.
     """
+    default = {**_DEFAULT_ID_DATA, "confidence": "low"}
+
     if not page_numbers:
         logger.info("ID Agent — no identity pages to process")
-        return dict(_DEFAULT_ID_DATA)
+        return default
 
     combined_text = collect_page_texts(pages, page_numbers)
     if not combined_text.strip():
         logger.warning("ID Agent — identity pages are empty")
-        return dict(_DEFAULT_ID_DATA)
+        return default
 
     try:
         raw = call_llm(ID_SYSTEM_PROMPT, combined_text)
         parsed = json.loads(raw)
-        # Ensure all expected keys exist
-        result: dict[str, Any] = {}
-        for key in _DEFAULT_ID_DATA:
-            result[key] = parsed.get(key)
-        return result
+
+        if not isinstance(parsed, dict):
+            logger.warning("ID Agent — LLM returned non-dict JSON")
+            return default
+
+        validated = _validate_id_data(parsed)
+        validated["confidence"] = _compute_confidence(validated)
+        return validated
+
     except (json.JSONDecodeError, KeyError, IndexError) as exc:
         logger.warning("ID Agent — failed to parse LLM response: %s", exc)
-        return dict(_DEFAULT_ID_DATA)
+        return default
     except Exception as exc:
         logger.error("ID Agent — LLM call failed: %s", exc)
-        return dict(_DEFAULT_ID_DATA)
+        return default
 
 
 def id_agent_node(state: ClaimState) -> dict[str, Any]:
@@ -86,6 +134,10 @@ def id_agent_node(state: ClaimState) -> dict[str, Any]:
         state["claim_id"],
         page_numbers,
     )
-    id_data = extract_identity(state["pages"], page_numbers)
-    logger.info("ID Agent — claim_id=%s result=%s", state["claim_id"], id_data)
+    try:
+        id_data = extract_identity(state["pages"], page_numbers)
+    except Exception as exc:
+        logger.exception("ID Agent — unhandled error for claim %s", state["claim_id"])
+        id_data = {**_DEFAULT_ID_DATA, "confidence": "low"}
+    logger.info("ID Agent — claim_id=%s confidence=%s result=%s", state["claim_id"], id_data.get("confidence"), id_data)
     return {"id_data": id_data}
