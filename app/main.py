@@ -5,9 +5,12 @@ import os
 import sys
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from app.api.routes import router
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
