@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from app.graph.workflow import run_claim_workflow
 from app.services.pdf_parser import extract_pages
 
 logger = logging.getLogger(__name__)
@@ -117,8 +118,17 @@ async def process_claim(
         logger.warning("PDF extraction failed for claim %s: %s", validated_claim_id, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # --- Phase 3: LangGraph workflow ---
+    try:
+        final_output = run_claim_workflow(validated_claim_id, pages)
+    except Exception as exc:
+        logger.exception("Workflow failed for claim %s", validated_claim_id)
+        raise HTTPException(
+            status_code=500, detail="Claim processing workflow failed."
+        ) from exc
+
     logger.info(
-        "Claim parsed — claim_id=%s file=%s pages=%d",
+        "Claim processed — claim_id=%s file=%s pages=%d",
         validated_claim_id,
         file.filename,
         len(pages),
@@ -127,7 +137,8 @@ async def process_claim(
         "claim_id": validated_claim_id,
         "filename": file.filename,
         "pages_count": len(pages),
-        "status": "parsed",
+        "status": "processed",
+        "output": final_output,
     }
 
 
