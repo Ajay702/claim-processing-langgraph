@@ -2,11 +2,9 @@
 
 import json
 import logging
-import os
 from typing import Any
 
-from cerebras.cloud.sdk import Cerebras
-
+from app.graph.nodes.llm_client import call_llm
 from app.graph.state import ClaimState
 
 logger = logging.getLogger(__name__)
@@ -42,23 +40,6 @@ Respond with ONLY a JSON object in this exact format:
 
 Do not include any explanation, commentary, or additional text."""
 
-_client: Cerebras | None = None
-
-
-def _get_client() -> Cerebras:
-    """Return a cached Cerebras client, initialised on first call.
-
-    Raises:
-        RuntimeError: If CEREBRAS_API_KEY is not set.
-    """
-    global _client
-    if _client is None:
-        api_key = os.getenv("CEREBRAS_API_KEY")
-        if not api_key:
-            raise RuntimeError("CEREBRAS_API_KEY environment variable is not set.")
-        _client = Cerebras(api_key=api_key)
-    return _client
-
 
 def classify_page(text: str) -> str:
     """Classify a single page's text into a document type via the LLM.
@@ -75,18 +56,7 @@ def classify_page(text: str) -> str:
         return "other"
 
     try:
-        client = _get_client()
-        response = client.chat.completions.create(
-            model="gpt-oss-120b",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            top_p=1,
-            stream=False,
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = call_llm(SYSTEM_PROMPT, text)
         parsed = json.loads(raw)
         doc_type = parsed.get("document_type", "other")
 
